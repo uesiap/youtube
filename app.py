@@ -21,17 +21,17 @@ SECRET_KEY      = os.environ.get('SECRET_KEY', 'change-me-in-prod')
 MAX_DURATION    = int(os.environ.get('MAX_DURATION', 1800))
 ALLOWED_ORIGINS = set(filter(None, os.environ.get('ALLOWED_ORIGINS', '').split(',')))
 
-# ── ffmpeg (on PATH via Docker) ───────────────────────────────────────────────
+# ── ffmpeg ────────────────────────────────────────────────────────────────────
 ffmpeg_path = shutil.which('ffmpeg') or ''
 ffmpeg_dir  = os.path.dirname(ffmpeg_path) if ffmpeg_path else ''
 log.info("ffmpeg: %s", ffmpeg_path or "NOT FOUND")
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
-_rl_lock           = threading.Lock()
-_rl_counts         = defaultdict(list)
-RATE_LIMIT_WINDOW  = 60
-RATE_LIMIT_INFO    = 20
-RATE_LIMIT_STREAM  = 5
+_rl_lock          = threading.Lock()
+_rl_counts        = defaultdict(list)
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_INFO   = 20
+RATE_LIMIT_STREAM = 5
 
 def _client_ip():
     xff = request.headers.get('X-Forwarded-For', '')
@@ -94,19 +94,32 @@ def apply_cors(resp):
 @app.after_request
 def security_headers(resp):
     h = resp.headers
-    h['X-Content-Type-Options']  = 'nosniff'
-    h['X-Frame-Options']         = 'DENY'
-    h['Referrer-Policy']         = 'no-referrer'
-    h['Permissions-Policy']      = 'geolocation=(), camera=(), microphone=()'
+    h['X-Content-Type-Options'] = 'nosniff'
+    h['X-Frame-Options']        = 'DENY'
+    h['Referrer-Policy']        = 'no-referrer'
+    h['Permissions-Policy']     = 'geolocation=(), camera=(), microphone=()'
     if 'Cache-Control' not in h:
         h['Cache-Control'] = 'no-store'
     return resp
 
-# ── Input validation ──────────────────────────────────────────────────────────
+# ── Quality normalisation ─────────────────────────────────────────────────────
+# Accept "192kbps" → "192",  "720p" stays "720p"
+_QUALITY_MP3 = {'64', '128', '192', '320'}
+_QUALITY_MP4 = {'360p', '480p', '720p', '1080p'}
+
+def normalise_quality(fmt: str, raw: str) -> str:
+    """Strip kbps/k suffixes for audio; lowercase for video."""
+    q = re.sub(r'kbps$', '', raw.strip(), flags=re.I)   # "192kbps" → "192"
+    q = re.sub(r'k$',    '', q,           flags=re.I)   # "192k"    → "192"
+    q = q.lower()
+    allowed = _QUALITY_MP3 if fmt == 'mp3' else _QUALITY_MP4
+    if q not in allowed:
+        abort(400, f'quality must be one of: {", ".join(sorted(allowed))}')
+    return q
+
+# ── URL validation ────────────────────────────────────────────────────────────
 _ALLOWED_HOSTS = re.compile(
     r'^https?://(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com|m\.youtube\.com)', re.I)
-_QUALITY_MP3   = {'64','128','192','256','320'}
-_QUALITY_MP4   = {'360p','480p','720p','1080p'}
 
 def validate_url(url):
     url = url.strip()
@@ -119,12 +132,9 @@ def validate_url(url):
         abort(400, 'Invalid URL scheme')
     return url
 
-def validate_format(fmt, quality):
+def validate_format(fmt):
     if fmt not in ('mp3', 'mp4'):
         abort(400, 'format must be mp3 or mp4')
-    allowed_q = _QUALITY_MP3 if fmt == 'mp3' else _QUALITY_MP4
-    if quality not in allowed_q:
-        abort(400, f'quality must be one of: {", ".join(sorted(allowed_q))}')
 
 # ── yt-dlp ────────────────────────────────────────────────────────────────────
 _INFO_OPTS = {
@@ -140,7 +150,7 @@ def get_info(url):
     if duration > MAX_DURATION:
         abort(400, f'Video too long (max {MAX_DURATION // 60} min)')
     title = info.get('title', 'download')
-    safe  = ''.join(c for c in title.encode('ascii','ignore').decode()
+    safe  = ''.join(c for c in title.encode('ascii', 'ignore').decode()
                     if c.isalnum() or c in ' -_')[:60].strip() or 'download'
     return safe, info
 
@@ -158,15 +168,17 @@ def info_route():
         log.error("/info error: %s", e)
         return jsonify({'error': str(e)}), 500
 
+
 @app.route('/stream')
 @block_bots
 @rate_limit(RATE_LIMIT_STREAM)
 def stream_route():
     url     = validate_url(request.args.get('url', ''))
-    fmt     = request.args.get('format', 'mp3')
-    quality = request.args.get('quality', '192' if fmt == 'mp3' else '720p')
+    fmt     = request.args.get('format', 'mp3').lower()
+    raw_q   = request.args.get('quality', '192kbps' if fmt == 'mp3' else '720p')
 
-    validate_format(fmt, quality)
+    validate_format(fmt)
+    quality = normalise_quality(fmt, raw_q)
 
     try:
         title, _ = get_info(url)
@@ -185,15 +197,21 @@ def stream_route():
     ]
 
     if fmt == 'mp3':
-        cmd  = base_flags + ['-f', 'bestaudio/best',
-                             '--extract-audio', '--audio-format', 'mp3',
-                             '--audio-quality', quality, url]
+        cmd  = base_flags + [
+            '-f', 'bestaudio/best',
+            '--extract-audio', '--audio-format', 'mp3',
+            '--audio-quality', quality,   # plain "192"
+            url,
+        ]
         mime = 'audio/mpeg'
     else:
-        h    = quality.replace('p', '')
-        cmd  = base_flags + ['-f',
-               f'bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/best[height<={h}][ext=mp4]/best',
-               '--merge-output-format', 'mp4', url]
+        h   = quality.replace('p', '')    # "720p" → "720"
+        cmd = base_flags + [
+            '-f', (f'bestvideo[height<={h}][ext=mp4]+'
+                   f'bestaudio[ext=m4a]/best[height<={h}][ext=mp4]/best'),
+            '--merge-output-format', 'mp4',
+            url,
+        ]
         mime = 'video/mp4'
 
     def generate():
@@ -222,9 +240,11 @@ def stream_route():
         },
     )
 
+
 @app.route('/healthz')
 def healthz():
     return 'ok', 200
+
 
 @app.errorhandler(400)
 def bad_request(e):  return jsonify({'error': str(e.description)}), 400
@@ -234,6 +254,7 @@ def forbidden(e):    return jsonify({'error': 'Forbidden'}), 403
 def too_many(e):     return jsonify({'error': 'Too many requests'}), 429
 @app.errorhandler(500)
 def server_error(e): return jsonify({'error': 'Internal server error'}), 500
+
 
 if __name__ == '__main__':
     app.run(debug=False, port=10000, threaded=True)
