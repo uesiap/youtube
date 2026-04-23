@@ -103,14 +103,12 @@ def security_headers(resp):
     return resp
 
 # ── Quality normalisation ─────────────────────────────────────────────────────
-# Accept "192kbps" → "192",  "720p" stays "720p"
 _QUALITY_MP3 = {'64', '128', '192', '320'}
 _QUALITY_MP4 = {'360p', '480p', '720p', '1080p'}
 
 def normalise_quality(fmt: str, raw: str) -> str:
-    """Strip kbps/k suffixes for audio; lowercase for video."""
-    q = re.sub(r'kbps$', '', raw.strip(), flags=re.I)   # "192kbps" → "192"
-    q = re.sub(r'k$',    '', q,           flags=re.I)   # "192k"    → "192"
+    q = re.sub(r'kbps$', '', raw.strip(), flags=re.I)
+    q = re.sub(r'k$',    '', q,           flags=re.I)
     q = q.lower()
     allowed = _QUALITY_MP3 if fmt == 'mp3' else _QUALITY_MP4
     if q not in allowed:
@@ -162,10 +160,13 @@ def info_route():
     body = request.get_json(silent=True) or {}
     url  = validate_url(body.get('url', ''))
     try:
-        title, _ = get_info(url)
-        return jsonify({'title': title})
+        title, info = get_info(url)
+        return jsonify({
+            'title':    title,
+            'duration': info.get('duration', 0),
+        })
     except Exception as e:
-        log.error("/info error: %s", e)
+        log.error("/info error for %s: %s", url, e)
         return jsonify({'error': str(e)}), 500
 
 
@@ -175,16 +176,18 @@ def info_route():
 def stream_route():
     url     = validate_url(request.args.get('url', ''))
     fmt     = request.args.get('format', 'mp3').lower()
-    raw_q   = request.args.get('quality', '192kbps' if fmt == 'mp3' else '720p')
+    raw_q   = request.args.get('quality', '192' if fmt == 'mp3' else '720p')
 
     validate_format(fmt)
     quality = normalise_quality(fmt, raw_q)
 
+    # Try to get a clean title for Content-Disposition.
+    # We don't abort on failure — streaming is more important than the filename.
+    title = 'download'
     try:
         title, _ = get_info(url)
     except Exception as e:
-        log.error("/stream get_info error: %s", e)
-        return str(e), 500
+        log.warning("/stream get_info failed (using fallback title): %s", e)
 
     filename    = urllib.parse.quote(title + '.' + fmt)
     disposition = f'attachment; filename="{title}.{fmt}"; filename*=UTF-8\'\'{filename}'
@@ -200,12 +203,12 @@ def stream_route():
         cmd  = base_flags + [
             '-f', 'bestaudio/best',
             '--extract-audio', '--audio-format', 'mp3',
-            '--audio-quality', quality,   # plain "192"
+            '--audio-quality', quality,
             url,
         ]
         mime = 'audio/mpeg'
     else:
-        h   = quality.replace('p', '')    # "720p" → "720"
+        h   = quality.replace('p', '')
         cmd = base_flags + [
             '-f', (f'bestvideo[height<={h}][ext=mp4]+'
                    f'bestaudio[ext=m4a]/best[height<={h}][ext=mp4]/best'),
