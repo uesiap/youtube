@@ -6,7 +6,7 @@ Optimized for Render.com + comprehensive security hardening.
 from flask import Flask, request, Response, stream_with_context, jsonify, abort
 from functools import wraps
 import yt_dlp, subprocess, shutil, os, urllib.parse
-import time, re, logging
+import time, re, logging, base64, tempfile, atexit
 from collections import defaultdict
 import threading
 
@@ -25,6 +25,28 @@ ALLOWED_ORIGINS = set(filter(None, os.environ.get('ALLOWED_ORIGINS', '').split('
 ffmpeg_path = shutil.which('ffmpeg') or ''
 ffmpeg_dir  = os.path.dirname(ffmpeg_path) if ffmpeg_path else ''
 log.info("ffmpeg: %s", ffmpeg_path or "NOT FOUND")
+
+# ── Cookie setup ──────────────────────────────────────────────────────────────
+_COOKIE_FILE = None
+
+def _init_cookies():
+    global _COOKIE_FILE
+    b64 = os.environ.get('YOUTUBE_COOKIES_B64', '').strip()
+    if not b64:
+        log.warning("No YOUTUBE_COOKIES_B64 set — YouTube may bot-block requests")
+        return
+    try:
+        data = base64.b64decode(b64)
+        tmp  = tempfile.NamedTemporaryFile(delete=False, suffix='.txt', mode='wb')
+        tmp.write(data)
+        tmp.close()
+        _COOKIE_FILE = tmp.name
+        log.info("Cookies loaded: %s", _COOKIE_FILE)
+        atexit.register(lambda: os.unlink(_COOKIE_FILE) if os.path.exists(_COOKIE_FILE) else None)
+    except Exception as e:
+        log.error("Failed to init cookies: %s", e)
+
+_init_cookies()
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 _rl_lock          = threading.Lock()
@@ -134,15 +156,19 @@ def validate_format(fmt):
     if fmt not in ('mp3', 'mp4'):
         abort(400, 'format must be mp3 or mp4')
 
-# ── yt-dlp ────────────────────────────────────────────────────────────────────
-_INFO_OPTS = {
-    'quiet': True, 'no_warnings': True,
-    'skip_download': True, 'socket_timeout': 10,
-    'noplaylist': True,
-}
+# ── yt-dlp info ───────────────────────────────────────────────────────────────
+def _make_info_opts():
+    opts = {
+        'quiet': True, 'no_warnings': True,
+        'skip_download': True, 'socket_timeout': 10,
+        'noplaylist': True,
+    }
+    if _COOKIE_FILE:
+        opts['cookiefile'] = _COOKIE_FILE
+    return opts
 
 def get_info(url):
-    with yt_dlp.YoutubeDL(_INFO_OPTS) as ydl:
+    with yt_dlp.YoutubeDL(_make_info_opts()) as ydl:
         info = ydl.extract_info(url, download=False)
     duration = info.get('duration') or 0
     if duration > MAX_DURATION:
@@ -174,15 +200,15 @@ def info_route():
 @block_bots
 @rate_limit(RATE_LIMIT_STREAM)
 def stream_route():
-    url     = validate_url(request.args.get('url', ''))
-    fmt     = request.args.get('format', 'mp3').lower()
-    raw_q   = request.args.get('quality', '192' if fmt == 'mp3' else '720p')
+    url   = validate_url(request.args.get('url', ''))
+    fmt   = request.args.get('format', 'mp3').lower()
+    raw_q = request.args.get('quality', '192' if fmt == 'mp3' else '720p')
 
     validate_format(fmt)
     quality = normalise_quality(fmt, raw_q)
 
     # Try to get a clean title for Content-Disposition.
-    # We don't abort on failure — streaming is more important than the filename.
+    # Never abort on failure — streaming is more important than the filename.
     title = 'download'
     try:
         title, _ = get_info(url)
@@ -192,12 +218,15 @@ def stream_route():
     filename    = urllib.parse.quote(title + '.' + fmt)
     disposition = f'attachment; filename="{title}.{fmt}"; filename*=UTF-8\'\'{filename}'
 
+    # ── Build yt-dlp command ──────────────────────────────────────────────────
     base_flags = [
         'yt-dlp', '--no-playlist',
         '--socket-timeout', '15',
         '--ffmpeg-location', ffmpeg_dir,
         '-o', '-', '--quiet',
     ]
+    if _COOKIE_FILE:
+        base_flags += ['--cookies', _COOKIE_FILE]
 
     if fmt == 'mp3':
         cmd  = base_flags + [
@@ -217,13 +246,17 @@ def stream_route():
         ]
         mime = 'video/mp4'
 
-    # ── Pre-flight: catch errors before headers are sent ─────────────────────
+    # ── Pre-flight: catch errors before headers are sent ──────────────────────
+    preflight_cmd = [
+        'yt-dlp', '--simulate', '--no-playlist',
+        '--socket-timeout', '15', '--quiet', '--no-warnings',
+    ]
+    if _COOKIE_FILE:
+        preflight_cmd += ['--cookies', _COOKIE_FILE]
+    preflight_cmd.append(url)
+
     try:
-        check = subprocess.run(
-            ['yt-dlp', '--simulate', '--no-playlist',
-             '--socket-timeout', '15', '--quiet', '--no-warnings', url],
-            capture_output=True, timeout=40
-        )
+        check = subprocess.run(preflight_cmd, capture_output=True, timeout=40)
         if check.returncode != 0:
             err = check.stderr.decode(errors='ignore')[:600]
             log.error("yt-dlp preflight failed: %s", err)
