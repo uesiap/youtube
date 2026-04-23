@@ -214,9 +214,24 @@ def stream_route():
         ]
         mime = 'video/mp4'
 
+    # ── Pre-flight: catch errors before headers are sent ─────────────────────
+    try:
+        check = subprocess.run(
+            ['yt-dlp', '--simulate', '--no-playlist',
+             '--socket-timeout', '15', '--quiet', '--no-warnings', url],
+            capture_output=True, timeout=40
+        )
+        if check.returncode != 0:
+            err = check.stderr.decode(errors='ignore')[:600]
+            log.error("yt-dlp preflight failed: %s", err)
+            return jsonify({'error': 'Video unavailable — ' + err}), 500
+    except subprocess.TimeoutExpired:
+        log.error("yt-dlp preflight timeout")
+        return jsonify({'error': 'Request timed out — try again'}), 504
+
     def generate():
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, bufsize=0)
+                                stderr=subprocess.PIPE, bufsize=0)
         try:
             while True:
                 chunk = proc.stdout.read(65536)
@@ -227,8 +242,12 @@ def stream_route():
             proc.kill()
         finally:
             proc.stdout.close()
+            stderr_out = proc.stderr.read().decode(errors='ignore')
             proc.wait()
-            log.info("Stream done: %s fmt=%s q=%s", title, fmt, quality)
+            if stderr_out:
+                log.error("yt-dlp stderr [%s]: %s", title, stderr_out[:2000])
+            log.info("Stream done rc=%d: %s fmt=%s q=%s",
+                     proc.returncode, title, fmt, quality)
 
     return Response(
         stream_with_context(generate()),
