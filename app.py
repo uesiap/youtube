@@ -145,10 +145,6 @@ def get_info(url):
     return safe, info
 
 # ── Routes ────────────────────────────────────────────────────────────────────
-@app.route('/')
-def index():
-    return open(os.path.join(os.path.dirname(__file__), 'index.html'), encoding='utf-8').read()
-
 @app.route('/info', methods=['POST'])
 @block_bots
 @rate_limit(RATE_LIMIT_INFO)
