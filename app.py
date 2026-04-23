@@ -18,14 +18,15 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SECRET_KEY   = os.environ.get('SECRET_KEY', 'b0ffff3c2299551401bdfcf35ea9be8283c0aab612cc0241c5d813e4f0f2a393')   # used for token signing
+SECRET_KEY   = os.environ.get('SECRET_KEY', 'change-me-in-prod')   # used for token signing
 MAX_DURATION = int(os.environ.get('MAX_DURATION', 1800))            # 30 min cap
 ALLOWED_ORIGINS = set(filter(None, os.environ.get('ALLOWED_ORIGINS', '').split(',')))
 # Add your Render domain, e.g. "https://myapp.onrender.com"
 
-# ffmpeg
-ffmpeg_path = shutil.which('ffmpeg')
+# ffmpeg — guaranteed on PATH by Docker
+ffmpeg_path = shutil.which('ffmpeg') or ''
 ffmpeg_dir  = os.path.dirname(ffmpeg_path) if ffmpeg_path else ""
+log.info("ffmpeg: %s", ffmpeg_path or "NOT FOUND")
 
 # ── Rate limiting (in-process, good enough for Render single-instance) ────────
 _rl_lock   = threading.Lock()
