@@ -15,7 +15,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy app source
 COPY app.py .
-COPY index.html .
 
 ENV PYTHONUNBUFFERED=1
 
