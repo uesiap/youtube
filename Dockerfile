@@ -1,6 +1,7 @@
+# ── Stage 1: final image ──────────────────────────────────────────────────────
 FROM python:3.11-slim
 
-# Install ffmpeg properly (this is where apt-get DOES work — inside Docker build)
+# Install ffmpeg at Docker build time (full root access here — works perfectly)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg && \
     apt-get clean && \
@@ -8,13 +9,17 @@ RUN apt-get update && \
 
 WORKDIR /app
 
+# Install Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Copy app source
+COPY app.py .
+COPY index.html .
 
 ENV PYTHONUNBUFFERED=1
 
+# Render Docker services use port 10000 by default
 EXPOSE 10000
 
 CMD ["gunicorn", "app:app", \
