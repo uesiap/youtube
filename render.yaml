@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: yt-stream
+    env: python
+    buildCommand: |
+      pip install -r requirements.txt
+      apt-get update && apt-get install -y ffmpeg
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 0 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ALLOWED_ORIGINS
+        value: https://melamrahul.github.io,https://ruvs.in,https://rahul.serv00.net
+      - key: MAX_DURATION
+        value: "1800"
+    healthCheckPath: /healthz
+    autoDeploy: true
