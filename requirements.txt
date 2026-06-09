@@ -1,5 +1,3 @@
 flask
-cloudscraper
 gunicorn
-requests
-httpx
+curl_cffi
