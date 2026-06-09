@@ -41,18 +41,27 @@ def refresh_cookies():
                 page = context.new_page()
 
                 print("[STEP1] Visiting ssvid.net...", flush=True)
-                page.goto(TARGET + "/en/youtube-video-downloader-4", wait_until="networkidle", timeout=30000)
-                page.wait_for_timeout(3000)  # wait for CF to set cookies
+                page.goto(TARGET + "/en/youtube-video-downloader-4", wait_until="networkidle", timeout=60000)
+
+                # Wait up to 15 seconds for cf_clearance to appear
+                print("[WAIT] Waiting for cf_clearance...", flush=True)
+                for i in range(15):
+                    cookies = context.cookies()
+                    names = [c['name'] for c in cookies]
+                    print(f"[CHECK {i+1}] Cookies so far: {names}", flush=True)
+                    if "cf_clearance" in names:
+                        print("[OK] cf_clearance found!", flush=True)
+                        break
+                    page.wait_for_timeout(1000)
 
                 cookies = context.cookies()
-                print(f"[INFO] Cookies: {[c['name'] for c in cookies]}", flush=True)
-
-                cookie_string = cookies_to_header(cookies)
-                cookie_dict = {c["name"]: c["value"] for c in cookies}
-
                 browser.close()
 
-            if cookie_string:
+            cookie_string = cookies_to_header(cookies)
+            cookie_dict = {c["name"]: c["value"] for c in cookies}
+            names = list(cookie_dict.keys())
+
+            if "cf_clearance" in names:
                 cookie_cache.update({
                     "cookies": cookie_dict,
                     "cookie_string": cookie_string,
@@ -60,10 +69,17 @@ def refresh_cookies():
                     "last_error": "",
                     "last_status": 200
                 })
-                print(f"[OK] Cookies saved: {list(cookie_dict.keys())}", flush=True)
+                print(f"[OK] cf_clearance saved!", flush=True)
             else:
-                cookie_cache["last_error"] = "Playwright returned no cookies"
-                print("[WARN] No cookies from Playwright", flush=True)
+                # Save whatever we have but flag missing cf_clearance
+                cookie_cache.update({
+                    "cookies": cookie_dict,
+                    "cookie_string": cookie_string,
+                    "updated_at": time.time(),
+                    "last_error": f"No cf_clearance. Got: {names}",
+                    "last_status": 200
+                })
+                print(f"[WARN] No cf_clearance. Got: {names}", flush=True)
 
         except Exception as e:
             cookie_cache["last_error"] = str(e)
