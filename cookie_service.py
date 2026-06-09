@@ -1,8 +1,7 @@
-import cloudscraper
 import time
 import threading
-import requests
 from flask import Flask, jsonify
+from curl_cffi import requests as cffi_requests
 
 app = Flask(__name__)
 TARGET = "https://ssvid.net"
@@ -12,38 +11,35 @@ cookie_cache = {
     "cookie_string": "",
     "updated_at": 0,
     "last_error": "",
-    "last_status": 0
+    "last_status": 0,
+    "response_size": 0
 }
 
 REFRESH_INTERVAL = 300
 
-def make_scraper():
-    return cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "mobile": False},
-        delay=10
-    )
+session = cffi_requests.Session(impersonate="chrome120")
 
 def refresh_cookies():
     while True:
-        scraper = make_scraper()  # fresh scraper each time
         try:
-            r = scraper.get(
+            r = session.get(
                 TARGET + "/en/youtube-video-downloader-4",
                 timeout=30,
                 headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                     "Accept-Language": "en-US,en;q=0.9",
                     "Accept-Encoding": "gzip, deflate, br",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
                 }
             )
 
             cookie_cache["last_status"] = r.status_code
-            print(f"[INFO] Status: {r.status_code}, URL: {r.url}", flush=True)
-            print(f"[INFO] Response length: {len(r.text)}", flush=True)
+            cookie_cache["response_size"] = len(r.text)
+            print(f"[INFO] Status: {r.status_code} | Size: {len(r.text)} bytes", flush=True)
 
-            cookies = dict(scraper.cookies)
-            print(f"[INFO] Cookies found: {list(cookies.keys())}", flush=True)
+            cookies = dict(session.cookies)
+            print(f"[INFO] Cookies: {list(cookies.keys())}", flush=True)
 
             if cookies:
                 cookie_cache.update({
@@ -52,22 +48,10 @@ def refresh_cookies():
                     "updated_at": time.time(),
                     "last_error": ""
                 })
-                print(f"[OK] Cookies refreshed: {list(cookies.keys())}", flush=True)
+                print(f"[OK] Got cookies: {list(cookies.keys())}", flush=True)
             else:
-                # Even if no cookies, store session cookies from response
-                resp_cookies = dict(r.cookies)
-                print(f"[INFO] Response cookies: {list(resp_cookies.keys())}", flush=True)
-                if resp_cookies:
-                    cookie_cache.update({
-                        "cookies": resp_cookies,
-                        "cookie_string": "; ".join(f"{k}={v}" for k, v in resp_cookies.items()),
-                        "updated_at": time.time(),
-                        "last_error": ""
-                    })
-                    print(f"[OK] Used response cookies: {list(resp_cookies.keys())}", flush=True)
-                else:
-                    cookie_cache["last_error"] = f"No cookies returned. Status: {r.status_code}"
-                    print(f"[WARN] No cookies at all. Status={r.status_code}", flush=True)
+                cookie_cache["last_error"] = f"No cookies. Status={r.status_code} Size={len(r.text)}"
+                print(f"[WARN] No cookies returned", flush=True)
 
         except Exception as e:
             cookie_cache["last_error"] = str(e)
@@ -76,7 +60,7 @@ def refresh_cookies():
         time.sleep(REFRESH_INTERVAL)
 
 threading.Thread(target=refresh_cookies, daemon=True).start()
-time.sleep(6)
+time.sleep(8)
 
 @app.route("/")
 @app.route("/health")
@@ -86,7 +70,8 @@ def health():
         "has_cookies": bool(cookie_cache["cookie_string"]),
         "age_seconds": int(time.time() - cookie_cache["updated_at"]),
         "last_error": cookie_cache["last_error"],
-        "last_status": cookie_cache["last_status"]
+        "last_status": cookie_cache["last_status"],
+        "response_size": cookie_cache["response_size"]
     })
 
 @app.route("/cookies")
@@ -102,27 +87,8 @@ def get_cookies():
 
 @app.route("/refresh")
 def manual_refresh():
-    """Manually trigger a cookie refresh"""
-    cookie_cache["updated_at"] = 0  # force refresh on next cycle
-    threading.Thread(target=refresh_cookies_once).start()
+    threading.Thread(target=refresh_cookies, daemon=True).start()
     return jsonify({"ok": True, "message": "Refresh triggered"})
-
-def refresh_cookies_once():
-    scraper = make_scraper()
-    try:
-        r = scraper.get(TARGET + "/en/youtube-video-downloader-4", timeout=30)
-        cookies = dict(scraper.cookies) or dict(r.cookies)
-        if cookies:
-            cookie_cache.update({
-                "cookies": cookies,
-                "cookie_string": "; ".join(f"{k}={v}" for k, v in cookies.items()),
-                "updated_at": time.time(),
-                "last_error": ""
-            })
-            print(f"[OK] Manual refresh done: {list(cookies.keys())}", flush=True)
-    except Exception as e:
-        cookie_cache["last_error"] = str(e)
-        print(f"[ERR] Manual refresh: {e}", flush=True)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
