@@ -1,7 +1,8 @@
 import time
 import threading
-from flask import Flask, jsonify
-from curl_cffi import requests as cffi_requests
+import json
+from flask import Flask, jsonify, request
+from playwright.sync_api import sync_playwright
 
 app = Flask(__name__)
 TARGET = "https://ssvid.net"
@@ -14,68 +15,55 @@ cookie_cache = {
     "last_status": 0,
 }
 
-REFRESH_INTERVAL = 300
+REFRESH_INTERVAL = 270
 
-def make_session():
-    return cffi_requests.Session(impersonate="chrome120")
+def cookies_to_header(cookies):
+    return "; ".join(f"{c['name']}={c['value']}" for c in cookies)
 
 def refresh_cookies():
     while True:
-        session = make_session()
         try:
-            # Step 1: Visit homepage to get Cloudflare clearance
-            r1 = session.get(
-                TARGET + "/en/youtube-video-downloader-4",
-                timeout=30,
-                headers={
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.9",
-                }
-            )
-            print(f"[STEP1] Status={r1.status_code} Size={len(r1.text)}", flush=True)
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                    ]
+                )
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    viewport={"width": 1280, "height": 720},
+                    locale="en-US",
+                )
+                page = context.new_page()
 
-            # Step 2: Hit the search API with a test URL — this triggers cookie setting
-            payload = {
-                "query": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                "vt": "downloader",
-                "cf_token": ""
-            }
-            r2 = session.post(
-                TARGET + "/api/ajax/search",
-                data=payload,
-                timeout=30,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Origin": TARGET,
-                    "Referer": TARGET + "/en/youtube-video-downloader-4",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Accept": "*/*",
-                }
-            )
-            print(f"[STEP2] Status={r2.status_code} Body={r2.text[:200]}", flush=True)
+                print("[STEP1] Visiting ssvid.net...", flush=True)
+                page.goto(TARGET + "/en/youtube-video-downloader-4", wait_until="networkidle", timeout=30000)
+                page.wait_for_timeout(3000)  # wait for CF to set cookies
 
-            # Collect all cookies from session after both requests
-            cookies = dict(session.cookies)
-            print(f"[INFO] Cookies after API call: {list(cookies.keys())}", flush=True)
+                cookies = context.cookies()
+                print(f"[INFO] Cookies: {[c['name'] for c in cookies]}", flush=True)
 
-            if cookies:
+                cookie_string = cookies_to_header(cookies)
+                cookie_dict = {c["name"]: c["value"] for c in cookies}
+
+                browser.close()
+
+            if cookie_string:
                 cookie_cache.update({
-                    "cookies": cookies,
-                    "cookie_string": "; ".join(f"{k}={v}" for k, v in cookies.items()),
+                    "cookies": cookie_dict,
+                    "cookie_string": cookie_string,
                     "updated_at": time.time(),
                     "last_error": "",
-                    "last_status": r2.status_code
+                    "last_status": 200
                 })
-                print(f"[OK] Cookies saved: {list(cookies.keys())}", flush=True)
+                print(f"[OK] Cookies saved: {list(cookie_dict.keys())}", flush=True)
             else:
-                # No cookies but we have a valid session — store dummy marker
-                # and pass the session object directly via search endpoint
-                cookie_cache.update({
-                    "last_error": f"No cookies but got API response: {r2.text[:100]}",
-                    "last_status": r2.status_code,
-                    "updated_at": time.time()
-                })
-                print(f"[WARN] No cookies. API said: {r2.text[:200]}", flush=True)
+                cookie_cache["last_error"] = "Playwright returned no cookies"
+                print("[WARN] No cookies from Playwright", flush=True)
 
         except Exception as e:
             cookie_cache["last_error"] = str(e)
@@ -84,7 +72,7 @@ def refresh_cookies():
         time.sleep(REFRESH_INTERVAL)
 
 threading.Thread(target=refresh_cookies, daemon=True).start()
-time.sleep(10)
+time.sleep(15)  # give playwright time to finish first run
 
 @app.route("/")
 @app.route("/health")
@@ -113,35 +101,54 @@ def manual_refresh():
     threading.Thread(target=refresh_cookies, daemon=True).start()
     return jsonify({"ok": True, "message": "Refresh triggered"})
 
-# ── New: proxy the actual search so PHP can call us directly ──────────────────
 @app.route("/search", methods=["POST"])
 def search():
-    from flask import request
-    query = request.form.get("query") or request.json.get("query", "") if request.is_json else request.form.get("query", "")
-
+    query = request.form.get("query", "") or (request.get_json() or {}).get("query", "")
     if not query:
-        return jsonify({"status": "error", "mess": "No query provided"})
+        return jsonify({"status": "error", "mess": "No query"})
 
-    session = make_session()
+    cookie_string = cookie_cache.get("cookie_string", "")
+    if not cookie_string:
+        return jsonify({"status": "error", "mess": "No cookies yet, try again in a few seconds"})
+
     try:
-        # Visit page first
-        session.get(TARGET + "/en/youtube-video-downloader-4", timeout=30)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
+            # Inject saved cookies
+            cookie_list = [{"name": k, "value": v, "domain": "ssvid.net", "path": "/"} 
+                           for k, v in cookie_cache["cookies"].items()]
+            context.add_cookies(cookie_list)
 
-        # Now search
-        r = session.post(
-            TARGET + "/api/ajax/search",
-            data={"query": query, "vt": "downloader", "cf_token": ""},
-            timeout=30,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Origin": TARGET,
-                "Referer": TARGET + "/en/youtube-video-downloader-4",
-                "X-Requested-With": "XMLHttpRequest",
-                "Accept": "*/*",
-            }
-        )
-        print(f"[SEARCH] {query[:50]} => {r.status_code} {r.text[:100]}", flush=True)
-        return r.text, r.status_code, {"Content-Type": "application/json"}
+            page = context.new_page()
+            result_holder = {}
+
+            def handle_response(response):
+                if "/api/ajax/search" in response.url:
+                    try:
+                        result_holder["data"] = response.json()
+                        print(f"[SEARCH] Got API response", flush=True)
+                    except:
+                        pass
+
+            page.on("response", handle_response)
+            page.goto(TARGET + "/en/youtube-video-downloader-4", wait_until="domcontentloaded", timeout=20000)
+
+            # Fill in the URL and submit
+            page.wait_for_timeout(2000)
+            page.fill("input[name='query'], input[type='text'], #url-input, .url-input", query)
+            page.wait_for_timeout(500)
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(5000)
+
+            browser.close()
+
+        if "data" in result_holder:
+            return jsonify(result_holder["data"])
+        else:
+            return jsonify({"status": "error", "mess": "No API response intercepted"})
 
     except Exception as e:
         return jsonify({"status": "error", "mess": str(e)})
