@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: ssvid-cookie-service
+    runtime: python
+    buildCommand: pip install -r requirements.txt && playwright install chromium && playwright install-deps chromium
+    startCommand: gunicorn --workers 1 --bind 0.0.0.0:$PORT --timeout 120 cookie_service:app
