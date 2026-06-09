@@ -1,4 +1,4 @@
-# requirements.txt
 flask
 cloudscraper
 requests
+gunicorn
