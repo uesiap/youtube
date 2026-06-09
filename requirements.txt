@@ -1,4 +1,5 @@
 flask
 cloudscraper
-requests
 gunicorn
+requests
+httpx
